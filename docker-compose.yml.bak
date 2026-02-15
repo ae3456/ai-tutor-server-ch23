@@ -1,0 +1,106 @@
+# --- 23.3.1 节代码：docker-compose.yml ---
+
+version: '3.8' 
+
+services:
+  # 1. FastAPI 应用服务 (AI 核心)
+  ai-tutor-app:
+    build: 
+      context: . # 指定 Dockerfile 所在的目录 (当前目录)
+      dockerfile: Dockerfile 
+    container_name: ai-tutor-app
+    ports:
+      - "8888:8888" # 映射端口：将主机的 8888 端口映射到容器的 8888 端口
+    depends_on:
+      - rabbitmq # 确保在启动 FastAPI 之前，RabbitMQ 已经启动
+      - redis    # 确保在启动 FastAPI 之前，Redis 已经启动
+    environment:
+      # 关键：设置环境变量，让 FastAPI 知道如何连接 RabbitMQ 和 Redis
+      # 在 Docker 内部网络中，服务名即为主机名
+      REDIS_URL: "redis://redis:6379/0"
+      RABBITMQ_HOST: "rabbitmq"
+    command: uvicorn fastapi_app:app --host 0.0.0.0 --port 8888
+    restart: always # 容器退出时自动重启
+  # 2. LLM Worker 服务 (消费者)
+  llm-worker:
+    build: . # 使用和 ai-tutor-app 相同的 Dockerfile 和构建上下文
+    container_name: llm-worker
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: "rabbitmq"
+      REDIS_HOST: "redis"
+      BAIDU_VOICE_APP_ID: "xxx"
+      BAIDU_VOICE_API_KEY: "xxx"
+      BAIDU_VOICE_SECRET_KEY: "xxx"
+      LLM_BASE_URL: "https://ark.cn-beijing.volces.com/api/v3"
+      LLM_API_KEY: "8xxxxc"
+    # 关键：覆盖 Dockerfile 的 CMD，启动 llm_worker.py
+    command: python llm_worker.py
+    # volumes:
+    #   - ./app:/app
+    restart: always
+    
+  # 3. TTS Worker 服务 (消费者)
+  tts-worker:
+    build: . # 同样使用相同的 Dockerfile
+    container_name: tts-worker
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: "rabbitmq"
+
+      BAIDU_VOICE_APP_ID: "xx"
+      BAIDU_VOICE_API_KEY: "xxx"
+      BAIDU_VOICE_SECRET_KEY: "xxx"
+    # 关键：覆盖 Dockerfile 的 CMD，启动 tts_worker.py
+    command: python tts_worker.py
+    # volumes:
+    #   - ./app:/app
+    restart: always
+  # 4. RabbitMQ 消息队列服务
+  rabbitmq:
+    image: rabbitmq:3-management-alpine # 使用官方的轻量级镜像，并启用 Web 管理界面
+    container_name: rabbitmq-broker
+    ports:
+      - "5672:5672" # 消息队列端口
+      - "15672:15672" # Web 管理界面端口
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq # 持久化数据
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    # 添加 healthcheck
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+
+  # 3. Redis 内存数据库服务
+  redis:
+    image: redis:6.2-alpine # 使用官方的轻量级 Redis 镜像
+    container_name: redis-cache
+    ports:
+      - "6379:6379" # Redis 默认端口
+    volumes:
+      - redis_data:/data # 持久化数据
+    # 添加 healthcheck
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+
+# 卷 (Volumes) 定义：用于持久化存储数据
+volumes:
+  rabbitmq_data:
+  redis_data:

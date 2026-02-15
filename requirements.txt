@@ -1,0 +1,30 @@
+# FastAPI Web Framework and ASGI Server
+fastapi>=0.104.0,<0.110.0
+uvicorn[standard]>=0.23.0,<0.25.0
+
+# RabbitMQ Clients
+# pika for synchronous workers (llm_worker, tts_worker)
+pika>=1.3.0,<1.4.0
+# aio-pika for asynchronous FastAPI server
+aio-pika>=9.1.0,<9.5.0
+
+# LangChain Core and Community Libraries
+langchain==0.1.20
+langchain-community==0.0.38
+langchain-core==0.1.53
+langchain-openai==0.1.6
+aiohttp>=3.8.3,<4.0.0
+# Baidu AI SDKs
+# Baidu Voice SDK (ASR/TTS)
+baidu-aip>=4.16.0,<4.17.0
+chardet
+
+# Redis Client
+# Used by LangChain for chat message history
+redis>=5.0.0,<5.1.0
+
+# Environment Variable Management
+python-dotenv>=1.0.0,<1.1.0
+
+# Standard utilities (though sometimes included, explicit is better)
+# uuid is a built-in library, no need to install
