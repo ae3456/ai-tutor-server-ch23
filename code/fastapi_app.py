@@ -42,7 +42,7 @@ led_controller_connection: Optional[WebSocket] = None
 
 
 # 设置超时参数
-WEBSOCKET_TIMEOUT = 300.0  # 300秒超时（5分钟），避免音频传输期间发送心跳干扰
+WEBSOCKET_TIMEOUT = 60.0  # 60秒超时，更及时检测连接状态
 
 # --- 2. RabbitMQ 连接管理 (使用 aio-pika) ---
 async def listen_for_responses(channel: aio_pika.Channel):
@@ -75,17 +75,27 @@ async def listen_for_responses(channel: aio_pika.Channel):
                         continue
 
                     # 方法2：主动发送测试消息验证连接是否真的存活
+                    logger.info(f"[{user_id}] 开始连接测试...")
                     try:
                         # 发送一个小的测试包，设置短超时
+                        test_start = time.time()
                         await asyncio.wait_for(
                             ws.send_text(json.dumps({"event": "connection_test", "timestamp": time.time()})),
                             timeout=2.0
                         )
-                        logger.debug(f"[{user_id}] 连接测试通过")
+                        test_time = time.time() - test_start
+                        logger.info(f"[{user_id}] 连接测试通过，耗时 {test_time:.3f} 秒")
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[{user_id}] 连接测试超时(2秒)，连接可能已断开")
+                        if user_id in active_connections:
+                            del active_connections[user_id]
+                            logger.info(f"[{user_id}] 已从活跃连接中移除（测试超时）")
+                        continue
                     except Exception as e:
                         logger.warning(f"[{user_id}] 连接测试失败: {e}，移除连接")
                         if user_id in active_connections:
                             del active_connections[user_id]
+                            logger.info(f"[{user_id}] 已从活跃连接中移除（测试失败）")
                         continue
 
                     # 处理音频数据 (Base64 -> Bytes -> 流式发送)
@@ -104,44 +114,63 @@ async def listen_for_responses(channel: aio_pika.Channel):
                                 "message": ERROR_MESSAGES["tts_failed"]
                             }))
                         else:
-                            # --- 流式发送策略 (匹配ESP32客户端缓冲区) ---
-                            CHUNK_SIZE = 3200   # 每次发 3200 字节（匹配客户端200ms缓冲区）
-                            BURST_SIZE = 1     # 连续发 1 次后休息一下
+                            # --- 优化流式发送策略 ---
+                            # 减小块大小，减轻客户端处理压力
+                            CHUNK_SIZE = 1600   # 从3200减小到1600字节（匹配客户端100ms缓冲区）
+                            BURST_SIZE = 2      # 连续发2个块后休息
                             burst_count = 0
+                            sent_chunks = 0
+                            total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE  # 向上取整
+
+                            logger.info(f"[{user_id}] 音频总大小: {total_size} bytes, 分为 {total_chunks} 个块发送")
 
                             for i in range(0, total_size, CHUNK_SIZE):
                                 chunk = audio_bytes[i : i + CHUNK_SIZE]
+                                chunk_index = i // CHUNK_SIZE + 1
+
                                 try:
-                                    # 【关键修复】避免发送过小的数据块（可能导致WebSocket协议错误）
-                                    if len(chunk) < 128:  # 最小128字节，避免协议帧过小
+                                    # 【关键修复】避免发送过小的数据块
+                                    if len(chunk) < 128:
                                         # 如果是最后一个块且很小，合并到前一个块或跳过
                                         if i + CHUNK_SIZE >= total_size:
-                                            # 最后一个块太小，直接发送结束标志
                                             logger.debug(f"[{user_id}] 跳过过小的最后一个音频块: {len(chunk)} 字节")
                                             continue
                                         else:
-                                            # 中间的小块，尝试合并到下一个块
                                             next_chunk_size = min(CHUNK_SIZE, total_size - (i + CHUNK_SIZE))
                                             if next_chunk_size > 0:
                                                 chunk = audio_bytes[i : i + CHUNK_SIZE + next_chunk_size]
                                                 logger.debug(f"[{user_id}] 合并小音频块: {len(chunk)} 字节")
 
+                                    # 发送前快速检查连接状态
+                                    if hasattr(ws, 'close_code') and ws.close_code is not None:
+                                        logger.warning(f"[{user_id}] 发送前检测到连接已关闭，停止发送")
+                                        if user_id in active_connections:
+                                            del active_connections[user_id]
+                                        break
+
+                                    # 发送音频块
                                     await ws.send_bytes(chunk)
+                                    sent_chunks += 1
+
+                                    # 每10个块记录一次进度
+                                    if sent_chunks % 10 == 0:
+                                        logger.debug(f"[{user_id}] 发送进度: {sent_chunks}/{total_chunks} 个块 ({chunk_index}/{total_chunks})")
+
                                 except Exception as e:
-                                    logger.warning(f"[{user_id}] 发送音频时连接断开: {e}")
+                                    logger.warning(f"[{user_id}] 发送第 {chunk_index} 个音频块时连接断开: {e}")
                                     # 连接断开，从活跃连接中移除
                                     if user_id in active_connections:
                                         del active_connections[user_id]
                                         logger.info(f"[{user_id}] 已从活跃连接中移除")
                                     break
-                                
+
                                 burst_count += 1
                                 if burst_count >= BURST_SIZE:
                                     burst_count = 0
                                     # 增加休眠时间，给 ESP32 足够处理时间
-                                    await asyncio.sleep(0.01)  # 10ms 
-                            
-                            logger.info(f"[{user_id}] 音频流发送完毕")
+                                    await asyncio.sleep(0.015)  # 从10ms增加到15ms
+
+                            logger.info(f"[{user_id}] 音频流发送完毕，成功发送 {sent_chunks}/{total_chunks} 个块")
 
                     # 3. 发送结束标志 (这是 ESP32 停止播放的关键)
                     try:
@@ -220,7 +249,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await websocket.accept()
     # 存储活跃连接
     active_connections[user_id] = websocket
-    print(f"--- WebSocket: 客户端连接成功 User ID: {user_id} ---")
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    logger.info(f"--- WebSocket连接建立: User ID={user_id}, IP={client_ip} ---")
+    print(f"--- WebSocket: 客户端连接成功 User ID: {user_id}, IP: {client_ip} ---")
     
     # [关键逻辑] 维护每个连接的音频缓冲区
     client_state = {
@@ -240,8 +271,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 # 发送心跳保持连接
                 try:
                     await websocket.send_text(json.dumps({"event": "ping"}))
-                except:
-                    break
+                    logger.debug(f"[{user_id}] 心跳发送成功")
+                except Exception as e:
+                    logger.warning(f"[{user_id}] 心跳发送失败，连接可能已断开: {e}")
+                    break  # 心跳失败，退出循环
                 continue
 
             # A. 处理文本控制消息 (JSON)
@@ -337,12 +370,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             
     except WebSocketDisconnect:
         logger.info(f"--- WebSocket: 客户端正常断开 User ID: {user_id} ---")
+    except RuntimeError as e:
+        # 捕获特定错误：Cannot call "receive" once a disconnect message has been received
+        if "disconnect" in str(e).lower() or "receive" in str(e).lower():
+            logger.warning(f"--- WebSocket 连接已断开 User ID: {user_id}: {e} ---")
+        else:
+            logger.error(f"--- WebSocket RuntimeError User ID: {user_id}: {e} ---")
     except Exception as e:
         logger.error(f"--- WebSocket 错误 User ID: {user_id}: {e} ---")
     finally:
         # 移除断开的连接
         if user_id in active_connections:
             del active_connections[user_id]
+            logger.info(f"[{user_id}] 已从活跃连接中清理")
 
 
 # --- 4. LED控制器 WebSocket 端点 ---
