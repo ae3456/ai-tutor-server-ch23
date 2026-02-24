@@ -42,7 +42,7 @@ led_controller_connection: Optional[WebSocket] = None
 
 
 # 设置超时参数
-WEBSOCKET_TIMEOUT = 30.0  # 30秒超时
+WEBSOCKET_TIMEOUT = 300.0  # 300秒超时（5分钟），避免音频传输期间发送心跳干扰
 
 # --- 2. RabbitMQ 连接管理 (使用 aio-pika) ---
 async def listen_for_responses(channel: aio_pika.Channel):
@@ -65,7 +65,15 @@ async def listen_for_responses(channel: aio_pika.Channel):
                         continue
 
                     ws = active_connections[user_id]
-                    
+
+                    # 【关键修复】检查WebSocket连接状态
+                    # 检查close_code属性，如果连接已关闭则清理
+                    if hasattr(ws, 'close_code') and ws.close_code is not None:
+                        logger.warning(f"[{user_id}] WebSocket连接已关闭 (close_code={ws.close_code})，移除连接")
+                        if user_id in active_connections:
+                            del active_connections[user_id]
+                        continue
+
                     # 处理音频数据 (Base64 -> Bytes -> 流式发送)
                     audio_b64 = data.get("audio_data_base64")
                     if audio_b64:
@@ -90,9 +98,27 @@ async def listen_for_responses(channel: aio_pika.Channel):
                             for i in range(0, total_size, CHUNK_SIZE):
                                 chunk = audio_bytes[i : i + CHUNK_SIZE]
                                 try:
+                                    # 【关键修复】避免发送过小的数据块（可能导致WebSocket协议错误）
+                                    if len(chunk) < 128:  # 最小128字节，避免协议帧过小
+                                        # 如果是最后一个块且很小，合并到前一个块或跳过
+                                        if i + CHUNK_SIZE >= total_size:
+                                            # 最后一个块太小，直接发送结束标志
+                                            logger.debug(f"[{user_id}] 跳过过小的最后一个音频块: {len(chunk)} 字节")
+                                            continue
+                                        else:
+                                            # 中间的小块，尝试合并到下一个块
+                                            next_chunk_size = min(CHUNK_SIZE, total_size - (i + CHUNK_SIZE))
+                                            if next_chunk_size > 0:
+                                                chunk = audio_bytes[i : i + CHUNK_SIZE + next_chunk_size]
+                                                logger.debug(f"[{user_id}] 合并小音频块: {len(chunk)} 字节")
+
                                     await ws.send_bytes(chunk)
-                                except Exception:
-                                    logger.warning(f"[{user_id}] 发送音频时连接断开")
+                                except Exception as e:
+                                    logger.warning(f"[{user_id}] 发送音频时连接断开: {e}")
+                                    # 连接断开，从活跃连接中移除
+                                    if user_id in active_connections:
+                                        del active_connections[user_id]
+                                        logger.info(f"[{user_id}] 已从活跃连接中移除")
                                     break
                                 
                                 burst_count += 1
@@ -104,7 +130,14 @@ async def listen_for_responses(channel: aio_pika.Channel):
                             logger.info(f"[{user_id}] 音频流发送完毕")
 
                     # 3. 发送结束标志 (这是 ESP32 停止播放的关键)
-                    await ws.send_text(json.dumps({"event": "response_finished"}))
+                    try:
+                        await ws.send_text(json.dumps({"event": "response_finished"}))
+                    except Exception as e:
+                        logger.warning(f"[{user_id}] 发送结束标志失败: {e}")
+                        # 连接可能已断开，清理连接
+                        if user_id in active_connections:
+                            del active_connections[user_id]
+                            logger.info(f"[{user_id}] 已从活跃连接中移除")
                         
                 except Exception as e:
                     logger.error(f"转发消息异常: {e}")
