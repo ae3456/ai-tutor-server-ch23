@@ -39,6 +39,7 @@ active_connections: Dict[str, WebSocket] = {}
 
 # LED控制器连接（用于转发说话状态）
 led_controller_connection: Optional[WebSocket] = None
+led_controller_lock = asyncio.Lock()
 
 
 # 设置超时参数
@@ -124,9 +125,11 @@ async def listen_for_responses(channel: aio_pika.Channel):
 
                             logger.info(f"[{user_id}] 音频总大小: {total_size} bytes, 分为 {total_chunks} 个块发送")
 
-                            for i in range(0, total_size, CHUNK_SIZE):
-                                chunk = audio_bytes[i : i + CHUNK_SIZE]
-                                chunk_index = i // CHUNK_SIZE + 1
+
+                            try:
+                                for i in range(0, total_size, CHUNK_SIZE):
+                                    chunk = audio_bytes[i : i + CHUNK_SIZE]
+                                    chunk_index = i // CHUNK_SIZE + 1
 
                                 try:
                                     # 【关键修复】避免发送过小的数据块
@@ -171,6 +174,7 @@ async def listen_for_responses(channel: aio_pika.Channel):
                                     await asyncio.sleep(0.015)  # 从10ms增加到15ms
 
                             logger.info(f"[{user_id}] 音频流发送完毕，成功发送 {sent_chunks}/{total_chunks} 个块")
+                            finally:
 
                     # 3. 发送结束标志 (这是 ESP32 停止播放的关键)
                     try:
@@ -286,13 +290,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     if not isinstance(data, dict):
                         # 如果不是字典（如纯数字"1"或"0"），当作简单文本处理
                         if text == "1" or text == "0":
-                            if led_controller_connection:
-                                try:
-                                    await led_controller_connection.send_text(text)
-                                    logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
-                                except Exception as e:
-                                    logger.warning(f"转发到 LED 控制器失败: {e}")
-                                    led_controller_connection = None
+                            async with led_controller_lock:
+                                if led_controller_connection:
+                                    try:
+                                        await led_controller_connection.send_text(text)
+                                        logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
+                                    except Exception as e:
+                                        logger.warning(f"转发到 LED 控制器失败: {e}")
+                                        led_controller_connection = None
                         continue
                     event = data.get("event")
 
@@ -348,13 +353,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 except json.JSONDecodeError:
                     # 不是 JSON，可能是简单的文本消息（如 "1" 和 "0" 用于 LED 控制）
                     if text == "1" or text == "0":
-                        if led_controller_connection:
-                            try:
-                                await led_controller_connection.send_text(text)
-                                logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
-                            except Exception as e:
-                                logger.warning(f"转发到 LED 控制器失败: {e}")
-                                led_controller_connection = None
+                        async with led_controller_lock:
+                            if led_controller_connection:
+                                try:
+                                    await led_controller_connection.send_text(text)
+                                    logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
+                                except Exception as e:
+                                    logger.warning(f"转发到 LED 控制器失败: {e}")
+                                    led_controller_connection = None
 
             # B. 处理二进制音频数据
             elif "bytes" in message:
@@ -393,7 +399,8 @@ async def led_websocket_endpoint(websocket: WebSocket):
     """
     global led_controller_connection
     await websocket.accept()
-    led_controller_connection = websocket
+    async with led_controller_lock:
+        led_controller_connection = websocket
     logger.info("LED控制器已连接")
     
     try:
@@ -406,4 +413,5 @@ async def led_websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"LED控制器连接错误: {e}")
     finally:
-        led_controller_connection = None        
+        async with led_controller_lock:
+            led_controller_connection = None        
