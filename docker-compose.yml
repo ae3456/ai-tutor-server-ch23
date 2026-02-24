@@ -10,7 +10,7 @@ services:
       dockerfile: Dockerfile 
     container_name: ai-tutor-app
     ports:
-      - "8888:8888" # 映射端口：将主机的 8888 端口映射到容器的 8888 端口
+      - "8888:8888" # 映射端口：将主机的8888端口映射到容器的8888端口
     depends_on:
       - rabbitmq # 确保在启动 FastAPI 之前，RabbitMQ 已经启动
       - redis    # 确保在启动 FastAPI 之前，Redis 已经启动
@@ -19,7 +19,7 @@ services:
       # 在 Docker 内部网络中，服务名即为主机名
       REDIS_URL: "redis://redis:6379/0"
       RABBITMQ_HOST: "rabbitmq"
-    command: uvicorn fastapi_app:app --host 0.0.0.0 --port 8888
+    command: uvicorn fastapi_app:app --host 0.0.0.0 --port 8888 --ws-ping-interval 5 --ws-ping-timeout 10
     restart: always # 容器退出时自动重启
   # 2. LLM Worker 服务 (消费者)
   llm-worker:
@@ -37,7 +37,7 @@ services:
       BAIDU_VOICE_API_KEY: ${BAIDU_VOICE_API_KEY}
       BAIDU_VOICE_SECRET_KEY: ${BAIDU_VOICE_SECRET_KEY}
       LLM_BASE_URL: ${LLM_BASE_URL}
-      LLM_API_KEY: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
     # 关键：覆盖 Dockerfile 的 CMD，启动 llm_worker.py
     command: python llm_worker.py
     # volumes:
@@ -67,8 +67,8 @@ services:
     image: rabbitmq:3-management-alpine # 使用官方的轻量级镜像，并启用 Web 管理界面
     container_name: rabbitmq-broker
     ports:
-      - "5672:5672" # 消息队列端口
-      - "15672:15672" # Web 管理界面端口
+      - "5673:5672" # 消息队列端口
+      - "15673:15672" # Web 管理界面端口
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq # 持久化数据
     environment:
@@ -88,7 +88,7 @@ services:
     image: redis:6.2-alpine # 使用官方的轻量级 Redis 镜像
     container_name: redis-cache
     ports:
-      - "6379:6379" # Redis 默认端口
+      - "6380:6379" # Redis 默认端口
     volumes:
       - redis_data:/data # 持久化数据
     # 添加 healthcheck

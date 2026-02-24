@@ -23,19 +23,31 @@ try:
 except Exception as e:
     print(f"Warning: Baidu AipSpeech Client initialization failed. Check environment variables. Error: {e}")
 
+# 错误消息常量
+ERROR_MESSAGES = {
+    "asr_failed": "语音识别失败，请重试",
+    "tts_failed": "语音合成失败，请重试",
+    "llm_failed": "AI处理失败，请重试",
+    "timeout": "请求超时，请重试",
+    "unknown": "系统错误，请重试"
+}
+
 # --- 外部依赖模拟/假设已导入 ---
 def synthesize_speech_stream(text: str) -> bytes:
     """
     接收文本，调用百度 TTS API 合成语音，返回音频二进制流。
     """
+    if speech_client is None:
+        logger.error("百度语音客户端未初始化")
+        return b""
     # per=4 (女声), spd=5 (语速), pit=5 (语调)
     tts_result = speech_client.synthesis(
-        text, 'zh', 1, 
+        text, 'zh', 1,
         {
-            'vol': 5, 
-            'per': 5118, 
-            'spd': 3, 
-            'pit': 5, 
+            'vol': 5,
+            'per': 5118,
+            'spd': 3,
+            'pit': 5,
             'aue': 6,
             'audio_ctrl': {"sampling_rate":16000}}
     )
@@ -59,9 +71,32 @@ def callback(ch, method, properties, body):
         user_id = task_data['user_id']         
         task_id = task_data['task_id']         
         ai_response_text = task_data['ai_response_text'] # 接收 AI 回复文本                  
-        logger.info(f"[{user_id}][{task_id}] TTS Worker 收到任务。")
+        logger.info(f"[{user_id}][{task_id}] TTS Worker 收到任务。文本: {ai_response_text[:50]}...")
+        
         # 2. TTS 合成 (耗时操作)
         response_audio_bytes = synthesize_speech_stream(ai_response_text)
+        
+        # 【修复】检查 TTS 是否成功
+        if not response_audio_bytes:
+            logger.error(f"[{user_id}][{task_id}] TTS 合成失败！")
+            # 发送错误消息给客户端
+            error_message = {
+                "user_id": user_id,
+                "event": "error",
+                "type": "tts_failed",
+                "message": ERROR_MESSAGES["tts_failed"],
+                "audio_data_base64": ""  # 空音频
+            }
+            ch.basic_publish(
+                exchange='',
+                routing_key='websocket_response_queue',
+                body=json.dumps(error_message),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent
+                )
+            )
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
         
         # 3. Base64 编码
         encoded_audio = base64.b64encode(response_audio_bytes).decode('utf-8')

@@ -8,7 +8,7 @@ import aio_pika #
 import uuid
 import base64
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import logging
 # 配置日志格式
@@ -18,18 +18,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("FastAPI_WS") # 为 FastAPI 模块创建 Logger
 # --- 1. 配置与初始化 ---
-RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")  # Docker环境下使用服务名
 RABBITMQ_URL = f"amqp://guest:guest@{RABBITMQ_HOST}/"
 LLM_REQUEST_QUEUE = "llm_request_queue"
 TTS_REQUEST_QUEUE = "tts_request_queue" # TTS 队列
 WEBSOCKET_RESPONSE_QUEUE = "websocket_response_queue" # 回复队列
 
-
+# 错误消息常量
+ERROR_MESSAGES = {
+    "asr_failed": "语音识别失败，请重试",
+    "tts_failed": "语音合成失败，请重试",
+    "llm_failed": "AI处理失败，请重试",
+    "timeout": "请求超时，请重试",
+    "unknown": "系统错误，请重试"
+}
 
 #】用于存储 user_id 和 WebSocket 连接的对应关系
 # 这是一个简化的连接管理器
 active_connections: Dict[str, WebSocket] = {}
 
+# LED控制器连接（用于转发说话状态）
+led_controller_connection: Optional[WebSocket] = None
+
+
+# 设置超时参数
+WEBSOCKET_TIMEOUT = 30.0  # 30秒超时
 
 # --- 2. RabbitMQ 连接管理 (使用 aio-pika) ---
 async def listen_for_responses(channel: aio_pika.Channel):
@@ -59,27 +72,36 @@ async def listen_for_responses(channel: aio_pika.Channel):
                         audio_bytes = base64.b64decode(audio_b64)
                         total_size = len(audio_bytes)
                         logger.info(f"[{user_id}] 开始流式发送音频 ({total_size} bytes)...")
-
-                        # --- 流式发送策略 (Burst and Yield) ---
-                        CHUNK_SIZE = 1024  # 每次发 1KB
-                        BURST_SIZE = 8    # 连续发 8次 (8KB) 后休息一下
-                        burst_count = 0
-
-                        for i in range(0, total_size, CHUNK_SIZE):
-                            # 检查连接是否还活着
-                            if ws.client_state.name == "DISCONNECTED":
-                                break
-
-                            chunk = audio_bytes[i : i + CHUNK_SIZE]
-                            await ws.send_bytes(chunk)
-                            
-                            burst_count += 1
-                            if burst_count >= BURST_SIZE:
-                                burst_count = 0
-                                # 极短休眠，防止 ESP32 网络栈溢出，同时让出 CPU
-                                await asyncio.sleep(0.001) 
                         
-                        logger.info(f"[{user_id}] 音频流发送完毕")
+                        # 【修复】检查音频大小
+                        if total_size == 0:
+                            logger.error(f"[{user_id}] 收到空音频数据！")
+                            await ws.send_text(json.dumps({
+                                "event": "error",
+                                "type": "tts_failed",
+                                "message": ERROR_MESSAGES["tts_failed"]
+                            }))
+                        else:
+                            # --- 流式发送策略 (匹配ESP32客户端缓冲区) ---
+                            CHUNK_SIZE = 3200   # 每次发 3200 字节（匹配客户端200ms缓冲区）
+                            BURST_SIZE = 1     # 连续发 1 次后休息一下
+                            burst_count = 0
+
+                            for i in range(0, total_size, CHUNK_SIZE):
+                                chunk = audio_bytes[i : i + CHUNK_SIZE]
+                                try:
+                                    await ws.send_bytes(chunk)
+                                except Exception:
+                                    logger.warning(f"[{user_id}] 发送音频时连接断开")
+                                    break
+                                
+                                burst_count += 1
+                                if burst_count >= BURST_SIZE:
+                                    burst_count = 0
+                                    # 增加休眠时间，给 ESP32 足够处理时间
+                                    await asyncio.sleep(0.01)  # 10ms 
+                            
+                            logger.info(f"[{user_id}] 音频流发送完毕")
 
                     # 3. 发送结束标志 (这是 ESP32 停止播放的关键)
                     await ws.send_text(json.dumps({"event": "response_finished"}))
@@ -91,7 +113,8 @@ async def listen_for_responses(channel: aio_pika.Channel):
 async def lifespan(app: FastAPI):
     # --- Startup ---
     logger.info("系统启动中，正在连接 RabbitMQ...")
-    retry_interval = 3  # 重试间隔秒数
+    retry_count = 0
+    max_retry_interval = 60  # 最大重试间隔60秒
     while True:
         try:
             # 尝试建立连接
@@ -115,7 +138,10 @@ async def lifespan(app: FastAPI):
             logger.info("后台消息监听任务已启动")
             break
         except Exception as e:
-            logger.warning(f"RabbitMQ 连接失败，{retry_interval}秒后重试... 错误: {e}")
+            retry_count += 1
+            # 指数退避，上限60秒
+            retry_interval = min(3 * (2 ** min(retry_count, 5)), max_retry_interval)
+            logger.warning(f"RabbitMQ 连接失败，第{retry_count}次重试，{retry_interval}秒后重试... 错误: {e}")
             # 这里不要 break，而是等待后重试
             await asyncio.sleep(retry_interval)
 
@@ -143,6 +169,7 @@ app = FastAPI(lifespan=lifespan)
 # --- 3. WebSocket 路由 (生产者核心) ---
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    global led_controller_connection
     await websocket.accept()
     # 存储活跃连接
     active_connections[user_id] = websocket
@@ -159,12 +186,34 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     try:
         while True:
             # 使用通用的 receive() 来同时处理 text 和 bytes
-            message = await websocket.receive()
+            # 添加超时防止永久阻塞
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=WEBSOCKET_TIMEOUT)
+            except asyncio.TimeoutError:
+                # 发送心跳保持连接
+                try:
+                    await websocket.send_text(json.dumps({"event": "ping"}))
+                except:
+                    break
+                continue
 
             # A. 处理文本控制消息 (JSON)
             if "text" in message:
+                text = message["text"]
                 try:
-                    data = json.loads(message["text"])
+                    data = json.loads(text)
+                    # 确保解析后是一个字典
+                    if not isinstance(data, dict):
+                        # 如果不是字典（如纯数字"1"或"0"），当作简单文本处理
+                        if text == "1" or text == "0":
+                            if led_controller_connection:
+                                try:
+                                    await led_controller_connection.send_text(text)
+                                    logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
+                                except Exception as e:
+                                    logger.warning(f"转发到 LED 控制器失败: {e}")
+                                    led_controller_connection = None
+                        continue
                     event = data.get("event")
 
                     if event == "recording_started":
@@ -217,13 +266,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         client_state["is_recording"] = False
                         client_state["audio_buffer"].clear()
                 except json.JSONDecodeError:
-                    pass
+                    # 不是 JSON，可能是简单的文本消息（如 "1" 和 "0" 用于 LED 控制）
+                    if text == "1" or text == "0":
+                        if led_controller_connection:
+                            try:
+                                await led_controller_connection.send_text(text)
+                                logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
+                            except Exception as e:
+                                logger.warning(f"转发到 LED 控制器失败: {e}")
+                                led_controller_connection = None
 
             # B. 处理二进制音频数据
-            # elif "bytes" in message:
-            #     if client_state["is_recording"]:
-            #         # 将数据块追加到缓冲区
-            #         client_state["audio_buffer"].extend(message["bytes"])
             elif "bytes" in message:
                 # 【修改】：如果收到音频数据但状态是未录音，自动修正为正在录音
                 if not client_state["is_recording"]:
@@ -234,12 +287,36 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 
                 # 接收数据
                 client_state["audio_buffer"].extend(message["bytes"])
-
+            
     except WebSocketDisconnect:
-        logger.error(f"--- WebSocket: 客户端断开连接 User ID: {user_id} ---")
+        logger.info(f"--- WebSocket: 客户端正常断开 User ID: {user_id} ---")
     except Exception as e:
         logger.error(f"--- WebSocket 错误 User ID: {user_id}: {e} ---")
     finally:
         # 移除断开的连接
         if user_id in active_connections:
-            del active_connections[user_id]        
+            del active_connections[user_id]
+
+
+# --- 4. LED控制器 WebSocket 端点 ---
+@app.websocket("/ws/led")
+async def led_websocket_endpoint(websocket: WebSocket):
+    """
+    供组员的ESP32连接，接收说话状态控制LED
+    """
+    global led_controller_connection
+    await websocket.accept()
+    led_controller_connection = websocket
+    logger.info("LED控制器已连接")
+    
+    try:
+        while True:
+            # 保持连接，等待断开
+            data = await websocket.receive_text()
+            logger.debug(f"LED控制器消息: {data}")
+    except WebSocketDisconnect:
+        logger.info("LED控制器断开连接")
+    except Exception as e:
+        logger.error(f"LED控制器连接错误: {e}")
+    finally:
+        led_controller_connection = None        
