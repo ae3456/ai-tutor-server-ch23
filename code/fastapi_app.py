@@ -66,10 +66,24 @@ async def listen_for_responses(channel: aio_pika.Channel):
 
                     ws = active_connections[user_id]
 
-                    # 【关键修复】检查WebSocket连接状态
-                    # 检查close_code属性，如果连接已关闭则清理
+                    # 【关键修复】检查WebSocket连接状态 - 增强版
+                    # 方法1：检查close_code属性
                     if hasattr(ws, 'close_code') and ws.close_code is not None:
                         logger.warning(f"[{user_id}] WebSocket连接已关闭 (close_code={ws.close_code})，移除连接")
+                        if user_id in active_connections:
+                            del active_connections[user_id]
+                        continue
+
+                    # 方法2：主动发送测试消息验证连接是否真的存活
+                    try:
+                        # 发送一个小的测试包，设置短超时
+                        await asyncio.wait_for(
+                            ws.send_text(json.dumps({"event": "connection_test", "timestamp": time.time()})),
+                            timeout=2.0
+                        )
+                        logger.debug(f"[{user_id}] 连接测试通过")
+                    except Exception as e:
+                        logger.warning(f"[{user_id}] 连接测试失败: {e}，移除连接")
                         if user_id in active_connections:
                             del active_connections[user_id]
                         continue
