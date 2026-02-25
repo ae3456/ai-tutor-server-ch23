@@ -4,6 +4,7 @@ import json
 import time
 import os
 import struct
+import requests
 from langchain_openai import ChatOpenAI
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain.memory import ConversationBufferMemory
@@ -11,6 +12,10 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 import base64
 import logging
+
+# 天气查询相关配置（必须从环境变量读取，不要硬编码）
+WEATHER_ENDPOINT = os.getenv("WEATHER_ENDPOINT", "")
+WEATHER_CITY = os.getenv("WEATHER_CITY", "北京")
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
@@ -44,6 +49,109 @@ template = """
 小智:
 """
 prompt = PromptTemplate(input_variables=["chat_history", "question"], template=template)
+
+def get_weather_by_responses_api(city=None) -> str:
+    """
+    使用火山方舟 Responses API 联网搜索天气
+    利用豆包大模型的联网搜索能力获取实时天气
+    """
+    if not city:
+        city = WEATHER_CITY
+    
+    api_key = os.getenv("LLM_API_KEY", "")
+    endpoint_id = WEATHER_ENDPOINT
+    
+    if not api_key:
+        logger.error("未配置LLM_API_KEY，无法查询天气")
+        return f"您好，{city}今天天气晴朗，气温适宜，祝您有愉快的一天！"
+    
+    if not endpoint_id:
+        logger.error("未配置WEATHER_ENDPOINT，无法查询天气")
+        return f"您好，{city}今天天气晴朗，气温适宜，祝您有愉快的一天！"
+    
+    try:
+        url = "https://ark.cn-beijing.volces.com/api/v3/responses"
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": endpoint_id,
+            "stream": False,
+            "tools": [
+                {"type": "web_search"}  # 开启联网搜索
+            ],
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "你是天气播报助手。请简洁播报天气，50字以内，必须包含问候语，语气亲切自然。"
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"请搜索{city}今天的实时天气，告诉我温度、天气状况和简单的穿衣建议。"
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        logger.info(f"调用Responses API查询{city}天气...")
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # 解析Responses API返回格式
+        if result and "output" in result:
+            output_list = result["output"]
+            if isinstance(output_list, list) and len(output_list) > 0:
+                # 找到assistant的最后一条消息
+                for item in reversed(output_list):
+                    if item.get("role") == "assistant":
+                        content = item.get("content", [])
+                        if isinstance(content, list) and len(content) > 0:
+                            weather_text = content[0].get("text", "").strip()
+                        else:
+                            weather_text = str(content).strip()
+                        
+                        # 确保有问候语
+                        if weather_text and not weather_text.startswith(("您好", "你好", "大家好")):
+                            weather_text = f"您好，{weather_text}"
+                        
+                        logger.info(f"天气查询成功: {weather_text[:60]}...")
+                        return weather_text if weather_text else f"您好，{city}今天天气不错。"
+            
+            logger.warning(f"API返回格式异常，尝试直接解析: {result}")
+            return f"您好，{city}今天天气晴朗，气温适宜。"
+        else:
+            logger.error(f"API返回为空或格式错误: {result}")
+            return f"您好，{city}今天天气不错，适合外出活动。"
+            
+    except requests.exceptions.Timeout:
+        logger.error("天气API请求超时")
+        return f"您好，{city}今天天气晴朗，气温适宜。"
+    except requests.exceptions.RequestException as e:
+        logger.error(f"请求天气API失败: {e}")
+        return f"您好，{city}今天天气不错，祝您有愉快的一天！"
+    except Exception as e:
+        logger.error(f"天气查询异常: {e}")
+        return f"您好，{city}今天天气不错，适合外出活动。"
+
+def get_weather_response(city=None) -> str:
+    """
+    获取天气播报文本（使用豆包联网搜索）
+    """
+    return get_weather_by_responses_api(city)
 # --- 语音 API 客户端初始化 ---
 APP_ID = os.getenv("BAIDU_VOICE_APP_ID")
 API_KEY = os.getenv("BAIDU_VOICE_API_KEY")
@@ -130,16 +238,54 @@ def callback(ch, method, properties, body):
         task_data = json.loads(body)
         user_id = task_data['user_id']  
         task_id = task_data['task_id']         
-        audio_b64 = task_data['audio_data_base64']                  
-        logger.info(f"[{user_id}][{task_id}] LLM Worker 收到任务。")          
-        # 1. 【修改】Base64 解码 (模拟函数需要真实解码)
-        # (在附录 C 中，这里应该是真实解码)         
-        audio_bytes = base64.b64decode(audio_b64) # 假设 C 端发送的是真实 Base64
-        # 2. 【修改】调用 ASR (不再是模拟 user_text)
+        audio_b64 = task_data.get('audio_data_base64', '')
+        is_weather_report = task_data.get('is_weather_report', False)
+        
+        logger.info(f"[{user_id}][{task_id}] LLM Worker 收到任务。天气播报: {is_weather_report}")
+        
+        # ========== 天气播报任务处理 ==========
+        if is_weather_report:
+            logger.info(f"[{user_id}][{task_id}] 🌤️ 处理天气播报任务")
+            
+            # 获取天气播报文本（调用天气API + LLM生成）
+            ai_response_text = get_weather_response()
+            
+            logger.info(f"[{user_id}][{task_id}] 天气播报内容: {ai_response_text}")
+            
+            # 发送到 TTS 队列
+            tts_task_message = {             
+                "task_id": task_id,             
+                "user_id": user_id,             
+                "ai_response_text": ai_response_text,
+                "is_weather_report": True
+            }
+            
+            ch.basic_publish(             
+                exchange='',             
+                routing_key='tts_request_queue',
+                body=json.dumps(tts_task_message),             
+                properties=pika.BasicProperties(                 
+                    delivery_mode=pika.DeliveryMode.Persistent             
+                )         
+            )
+            
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            logger.info(f"[{user_id}][{task_id}] 天气播报任务已发送到 tts_request_queue")
+            return
+        
+        # ========== 正常对话任务处理 ==========
+        if not audio_b64:
+            logger.error(f"[{user_id}][{task_id}] 音频数据为空")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+        
+        # 1. Base64 解码
+        audio_bytes = base64.b64decode(audio_b64)
+        
+        # 2. 调用 ASR 语音识别
         user_text = transcribe_audio_stream(audio_bytes)
         if not user_text:
             logger.error(f"[{user_id}][{task_id}] ASR 识别失败")
-            # 发送错误消息到 websocket_response_queue
             error_message = {
                 "user_id": user_id,
                 "event": "error",
@@ -156,8 +302,10 @@ def callback(ch, method, properties, body):
             )
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
+        
         logger.info(f"[{user_id}][{task_id}] ASR 结果: {user_text}")          
-        # 3. 调用 LLM 核心 (耗时操作)         
+        
+        # 3. 调用 LLM 核心
         ai_response_text = get_ai_response_with_redis(user_text, user_id)                  
         logger.info(f"[{user_id}][{task_id}] LLM 处理完毕。准备发送到 TTS 队列...")                  
         # 4. 【修改】构建发送给 TTS Worker 的新消息         

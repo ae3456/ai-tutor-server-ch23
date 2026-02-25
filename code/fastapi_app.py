@@ -7,9 +7,11 @@ import asyncio
 import aio_pika # 
 import uuid
 import base64
+import random
 from contextlib import asynccontextmanager
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 import logging
 # 配置日志格式
 logging.basicConfig(
@@ -24,6 +26,13 @@ LLM_REQUEST_QUEUE = "llm_request_queue"
 TTS_REQUEST_QUEUE = "tts_request_queue" # TTS 队列
 WEBSOCKET_RESPONSE_QUEUE = "websocket_response_queue" # 回复队列
 
+# Pydantic 数据模型
+class TriggerAction(BaseModel):
+    source_device: str      # 触发设备ID
+    target_device: str      # 目标音箱ID
+    action: str             # 动作类型
+    timestamp: Optional[float] = None
+
 # 错误消息常量
 ERROR_MESSAGES = {
     "asr_failed": "语音识别失败，请重试",
@@ -33,13 +42,12 @@ ERROR_MESSAGES = {
     "unknown": "系统错误，请重试"
 }
 
-#】用于存储 user_id 和 WebSocket 连接的对应关系
+# 用于存储 user_id 和 WebSocket 连接的对应关系
 # 这是一个简化的连接管理器
 active_connections: Dict[str, WebSocket] = {}
 
-# LED控制器连接（用于转发说话状态）
-led_controller_connection: Optional[WebSocket] = None
-led_controller_lock = asyncio.Lock()
+# 存储注册的设备信息
+devices: Dict[str, dict] = {}
 
 
 # 设置超时参数
@@ -73,30 +81,6 @@ async def listen_for_responses(channel: aio_pika.Channel):
                         logger.warning(f"[{user_id}] WebSocket连接已关闭 (close_code={ws.close_code})，移除连接")
                         if user_id in active_connections:
                             del active_connections[user_id]
-                        continue
-
-                    # 方法2：主动发送测试消息验证连接是否真的存活
-                    logger.info(f"[{user_id}] 开始连接测试...")
-                    try:
-                        # 发送一个小的测试包，设置短超时
-                        test_start = time.time()
-                        await asyncio.wait_for(
-                            ws.send_text(json.dumps({"event": "connection_test", "timestamp": time.time()})),
-                            timeout=2.0
-                        )
-                        test_time = time.time() - test_start
-                        logger.info(f"[{user_id}] 连接测试通过，耗时 {test_time:.3f} 秒")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"[{user_id}] 连接测试超时(2秒)，连接可能已断开")
-                        if user_id in active_connections:
-                            del active_connections[user_id]
-                            logger.info(f"[{user_id}] 已从活跃连接中移除（测试超时）")
-                        continue
-                    except Exception as e:
-                        logger.warning(f"[{user_id}] 连接测试失败: {e}，移除连接")
-                        if user_id in active_connections:
-                            del active_connections[user_id]
-                            logger.info(f"[{user_id}] 已从活跃连接中移除（测试失败）")
                         continue
 
                     # 处理音频数据 (Base64 -> Bytes -> 流式发送)
@@ -173,8 +157,9 @@ async def listen_for_responses(channel: aio_pika.Channel):
                                     # 增加休眠时间，给 ESP32 足够处理时间
                                     await asyncio.sleep(0.015)  # 从10ms增加到15ms
 
-                            logger.info(f"[{user_id}] 音频流发送完毕，成功发送 {sent_chunks}/{total_chunks} 个块")
-                            finally:
+                                logger.info(f"[{user_id}] 音频流发送完毕，成功发送 {sent_chunks}/{total_chunks} 个块")
+                            except Exception as e:
+                                logger.error(f"[{user_id}] 音频流发送异常: {e}")
 
                     # 3. 发送结束标志 (这是 ESP32 停止播放的关键)
                     try:
@@ -246,13 +231,124 @@ async def lifespan(app: FastAPI):
 # 创建 FastAPI 应用实例
 app = FastAPI(lifespan=lifespan)
 
-# --- 3. WebSocket 路由 (生产者核心) ---
+# 模拟音箱播报过程
+async def simulate_speaking(device_id: str, duration: int = 6):
+    """模拟音箱播报过程"""
+    speaker = devices.get(device_id)
+    if not speaker:
+        return
+    
+    logger.info(f"[{time.strftime('%H:%M:%S')}] 音箱 [{device_id}] 开始{duration}秒播报...")
+    
+    # 播报过程中音量随机变化（每200ms更新一次）
+    for i in range(duration * 5):
+        if not speaker.get("is_speaking", False):
+            break
+        
+        # 模拟音量变化（1-4级）
+        speaker["volume_level"] = random.randint(1, 4)
+        await asyncio.sleep(0.2)
+    
+    # 播报结束
+    speaker["is_speaking"] = False
+    speaker["volume_level"] = 0
+    speaker["current_action"] = None
+    
+    logger.info(f"[{time.strftime('%H:%M:%S')}] 音箱 [{device_id}] 播报结束")
+
+# --- 3. HTTP API 路由 (天气播报触发) ---
+@app.post("/api/trigger/action")
+async def trigger_action(data: TriggerAction):
+    """
+    接收紫色板端的触发请求，控制音箱播放天气预报
+    """
+    source = data.source_device      # purple_board_001
+    target = data.target_device      # speaker_001
+    action = data.action             # "play_weather"
+    
+    logger.info(f"收到触发请求: source={source}, target={target}, action={action}")
+    
+    # 检查目标设备是否在线
+    if target not in active_connections:
+        logger.warning(f"目标音箱 [{target}] 不在线")
+        return {"status": "error", "message": f"音箱 [{target}] 不在线"}
+    
+    speaker_ws = active_connections[target]
+    
+    if action == "play_weather":
+        # 设置音箱状态
+        devices[target] = {
+            "type": "speaker",
+            "is_speaking": True,
+            "volume_level": 3,
+            "current_action": "weather_report",
+            "last_seen": time.time()
+        }
+        
+        logger.info(f"  🌤️ 音箱 [{target}] 开始播报天气")
+        
+        # 启动异步任务模拟播报过程（持续6秒）
+        asyncio.create_task(simulate_speaking(target, duration=6))
+        
+        # 通过WebSocket发送天气播报指令给音箱
+        try:
+            await speaker_ws.send_text(json.dumps({
+                "event": "play_weather",
+                "triggered_by": source,
+                "message": f"由{source}触发的天气预报"
+            }))
+            logger.info(f"已发送天气播报指令到音箱 [{target}]")
+        except Exception as e:
+            logger.error(f"发送天气播报指令失败: {e}")
+            return {"status": "error", "message": f"发送指令失败: {str(e)}"}
+        
+        # 🌤️ 通过RabbitMQ发送天气查询任务到LLM Worker
+        try:
+            channel = app.state.rabbitmq_channel
+            weather_task_id = str(uuid.uuid4())
+            weather_task_message = {
+                "task_id": weather_task_id,
+                "user_id": target,  # 使用目标音箱ID作为user_id
+                "audio_data_base64": "",  # 天气播报不需要录音，这里用空字符串作为标记
+                "is_weather_report": True,  # 标记为天气播报任务
+                "triggered_by": source,
+                "timestamp": time.time()
+            }
+            
+            await channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps(weather_task_message).encode(),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                ),
+                routing_key=LLM_REQUEST_QUEUE
+            )
+            logger.info(f"天气播报任务 {weather_task_id} 已发送到 LLM 队列")
+        except Exception as e:
+            logger.error(f"发送天气播报任务到队列失败: {e}")
+        
+        return {
+            "status": "success",
+            "message": f"音箱{target}正在播报天气 (由{source}触发)"
+        }
+    else:
+        return {"status": "error", "message": f"未知动作: {action}"}
+
+# --- 4. WebSocket 路由 (音箱连接) ---
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    global led_controller_connection
     await websocket.accept()
     # 存储活跃连接
     active_connections[user_id] = websocket
+    
+    # 注册设备
+    devices[user_id] = {
+        "type": "speaker",
+        "is_speaking": False,
+        "volume_level": 0,
+        "current_action": None,
+        "last_seen": time.time()
+    }
+    
     client_ip = websocket.client.host if websocket.client else "unknown"
     logger.info(f"--- WebSocket连接建立: User ID={user_id}, IP={client_ip} ---")
     print(f"--- WebSocket: 客户端连接成功 User ID: {user_id}, IP: {client_ip} ---")
@@ -288,17 +384,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     data = json.loads(text)
                     # 确保解析后是一个字典
                     if not isinstance(data, dict):
-                        # 如果不是字典（如纯数字"1"或"0"），当作简单文本处理
-                        if text == "1" or text == "0":
-                            async with led_controller_lock:
-                                if led_controller_connection:
-                                    try:
-                                        await led_controller_connection.send_text(text)
-                                        logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
-                                    except Exception as e:
-                                        logger.warning(f"转发到 LED 控制器失败: {e}")
-                                        led_controller_connection = None
                         continue
+                    
                     event = data.get("event")
 
                     if event == "recording_started":
@@ -350,17 +437,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     elif event == "recording_cancelled":
                         client_state["is_recording"] = False
                         client_state["audio_buffer"].clear()
+                        
+                    elif event == "weather_played":
+                        # 音箱报告天气播报完成
+                        logger.info(f"[{user_id}] 天气播报完成")
+                        if user_id in devices:
+                            devices[user_id]["is_speaking"] = False
+                            devices[user_id]["current_action"] = None
+                            
                 except json.JSONDecodeError:
-                    # 不是 JSON，可能是简单的文本消息（如 "1" 和 "0" 用于 LED 控制）
-                    if text == "1" or text == "0":
-                        async with led_controller_lock:
-                            if led_controller_connection:
-                                try:
-                                    await led_controller_connection.send_text(text)
-                                    logger.info(f"[{user_id}] 转发说话状态 '{text}' 到 LED 控制器")
-                                except Exception as e:
-                                    logger.warning(f"转发到 LED 控制器失败: {e}")
-                                    led_controller_connection = None
+                    # 不是 JSON，忽略
+                    pass
 
             # B. 处理二进制音频数据
             elif "bytes" in message:
@@ -389,29 +476,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         if user_id in active_connections:
             del active_connections[user_id]
             logger.info(f"[{user_id}] 已从活跃连接中清理")
-
-
-# --- 4. LED控制器 WebSocket 端点 ---
-@app.websocket("/ws/led")
-async def led_websocket_endpoint(websocket: WebSocket):
-    """
-    供组员的ESP32连接，接收说话状态控制LED
-    """
-    global led_controller_connection
-    await websocket.accept()
-    async with led_controller_lock:
-        led_controller_connection = websocket
-    logger.info("LED控制器已连接")
-    
-    try:
-        while True:
-            # 保持连接，等待断开
-            data = await websocket.receive_text()
-            logger.debug(f"LED控制器消息: {data}")
-    except WebSocketDisconnect:
-        logger.info("LED控制器断开连接")
-    except Exception as e:
-        logger.error(f"LED控制器连接错误: {e}")
-    finally:
-        async with led_controller_lock:
-            led_controller_connection = None        
+        # 移除设备信息
+        if user_id in devices:
+            del devices[user_id]        
